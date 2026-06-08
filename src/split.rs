@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::elf::{Elf, Section, SHT_NOBITS, SHT_REL, SHT_SYMTAB};
+use crate::elf::{Elf, Section, STT_FUNC, SHT_NOBITS, SHT_REL, SHT_SYMTAB};
 use crate::elf::section::Relocation;
 use crate::error::MWError;
 
@@ -34,6 +34,31 @@ struct SectionSplit {
     section_idx: usize,
     rel_section_idx: Option<usize>,
     entries: Vec<SplitEntry>,
+}
+
+/// For a LOCAL symbol referenced from `.text`, return the symtab index of the
+/// FUNC that uses it. mwcc assigns the @N jump-table counter out of symtab
+/// order, so sorting by using-FUNC index restores the original `.rodata` layout.
+fn using_function_sym_idx(elf: &Elf, target_sym_idx: usize) -> Option<usize> {
+    let text_idx = elf.sections.iter().position(|s| s.name == ".text")?;
+    let rel_text = elf
+        .sections
+        .iter()
+        .find(|s| s.sh_type == SHT_REL && s.name == ".rel.text")?;
+    let relocs = Relocation::unpack_all(&rel_text.data);
+    let reloc = relocs.iter().find(|r| r.symbol_index() == target_sym_idx)?;
+    let offset = reloc.r_offset;
+    elf.symtab
+        .symbols
+        .iter()
+        .enumerate()
+        .find(|(_, sym)| {
+            sym.st_shndx as usize == text_idx
+                && sym.type_id() == STT_FUNC
+                && sym.st_value <= offset
+                && offset < sym.st_value + sym.st_size
+        })
+        .map(|(idx, _)| idx)
 }
 
 fn collect_split_info(elf: &Elf, section_name: &str) -> Option<SectionSplit> {
@@ -94,7 +119,16 @@ fn collect_split_info(elf: &Elf, section_name: &str) -> Option<SectionSplit> {
         return None;
     }
     
-    entries.sort_by_key(|e| e.sym_idx);
+    entries.sort_by_key(|e| {
+        let sym = &elf.symtab.symbols[e.sym_idx];
+        // Only .rodata jump tables (@N) get their @N counter out of symtab
+        // order; sort those by using-function. Other sections already match.
+        if section_name == ".rodata" && sym.bind() == 0 && sym.name.starts_with('@') {
+            using_function_sym_idx(elf, e.sym_idx).unwrap_or(e.sym_idx)
+        } else {
+            e.sym_idx
+        }
+    });
 
     let rel_name = format!(".rel{}", section_name);
     let rel_section_idx = elf

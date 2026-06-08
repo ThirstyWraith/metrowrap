@@ -152,10 +152,11 @@ pub fn process_c_file(
         }
         elf.symbol_cleanup();
 
-        // INCLUDE_ASM merge: move DEFINED ___mw___ stub into its UND slot so
-        // the symbol keeps the earlier position mwcc would have emitted natively.
+        // INCLUDE_ASM merge: collapse each ___mw___ stub's UND/DEFINED pair into
+        // the earlier slot, where mwcc would have emitted the symbol natively.
         {
             let old_len = elf.symtab.symbols.len();
+            // (keep_idx, remove_idx); keep holds the DEFINED data afterward.
             let mut merges: Vec<(usize, usize)> = Vec::new();
             for (i, sym) in elf.symtab.symbols.iter().enumerate() {
                 if sym.st_shndx != 0 || sym.name.is_empty() {
@@ -164,22 +165,25 @@ pub fn process_c_file(
                 if let Some(def_idx) = elf.symtab.symbols.iter()
                     .position(|s| s.name == sym.name && s.st_shndx != 0)
                 {
-                    merges.push((i, def_idx));
+                    let (keep, remove) = if i < def_idx { (i, def_idx) } else { (def_idx, i) };
+                    merges.push((keep, remove));
                 }
             }
 
             if !merges.is_empty() {
-                for &(und_idx, def_idx) in &merges {
-                    let def_sym = elf.symtab.symbols[def_idx].clone();
-                    let und_st_name = elf.symtab.symbols[und_idx].st_name;
-                    elf.symtab.symbols[und_idx] = def_sym;
-                    elf.symtab.symbols[und_idx].st_name = und_st_name;
+                for &(keep_idx, remove_idx) in &merges {
+                    // If keep is the UND slot, move DEFINED data in (keeping st_name).
+                    if elf.symtab.symbols[keep_idx].st_shndx == 0 {
+                        let def_sym = elf.symtab.symbols[remove_idx].clone();
+                        let keep_st_name = elf.symtab.symbols[keep_idx].st_name;
+                        elf.symtab.symbols[keep_idx] = def_sym;
+                        elf.symtab.symbols[keep_idx].st_name = keep_st_name;
+                    }
                 }
 
-                // Build old→new index map; removed DEFINED entries collapse to
-                // the UND slot they were merged into.
+                // Build old→new index map; removed entries collapse to their kept slot.
                 let remove_set: HashSet<usize> =
-                    merges.iter().map(|(_, d)| *d).collect();
+                    merges.iter().map(|(_, r)| *r).collect();
                 let mut final_map: Vec<usize> = vec![0; old_len];
                 let mut new_idx = 0;
                 for old_idx in 0..old_len {
@@ -188,8 +192,8 @@ pub fn process_c_file(
                         new_idx += 1;
                     }
                 }
-                for &(und_idx, def_idx) in &merges {
-                    final_map[def_idx] = final_map[und_idx];
+                for &(keep_idx, remove_idx) in &merges {
+                    final_map[remove_idx] = final_map[keep_idx];
                 }
                 // Remap all relocations
                 for section in &mut elf.sections {
