@@ -64,16 +64,61 @@ fn collect_split_info(elf: &Elf, section_name: &str) -> Option<SectionSplit> {
 
     entries.sort_by_key(|e| e.original_value);
 
+    let rel_name = format!(".rel{}", section_name);
+    let rel_section_idx = elf
+        .sections
+        .iter()
+        .position(|s| s.name == rel_name && s.sh_type == SHT_REL);
+
+    // Offsets of every symbol and relocation in the section
+    let symbol_offsets: Vec<u32> = elf
+        .symtab
+        .symbols
+        .iter()
+        .filter(|sym| sym.st_shndx as usize == section_idx)
+        .map(|sym| sym.st_value)
+        .collect();
+    let relocation_offsets: Vec<u32> = rel_section_idx.map_or_else(Vec::new, |ri| {
+        Relocation::unpack_all(&elf.sections[ri].data)
+            .iter()
+            .map(|r| r.r_offset)
+            .collect()
+    });
+
+    // A gap is padding if no symbol or relocation lies in it and the
+    // section is NOBITS or the gap is all zero bytes
+    let is_padding = |start: u32, end: u32| {
+        let inside = |offset: &u32| (start..end).contains(offset);
+        !symbol_offsets.iter().any(inside)
+            && !relocation_offsets.iter().any(inside)
+            && (section.sh_type == SHT_NOBITS
+                || section.data[start as usize..end as usize]
+                    .iter()
+                    .all(|&b| b == 0))
+    };
+
     // Validate contiguous coverage
     let mut expected = 0u32;
     for entry in &entries {
+        if entry.original_value < expected {
+            eprintln!(
+                "split: {} symbol {} at 0x{:x} overlaps the previous symbol",
+                section_name, entry.name, entry.original_value
+            );
+            return None;
+        }
         // Account for alignment padding between symbols
         let align = alignment_for(&entry.name, entry.size);
         let aligned = (expected + align - 1) & !(align - 1);
-        if entry.original_value != expected && entry.original_value != aligned {
+        // mwcc pads arrays and structs to a 4-byte boundary
+        let padded = (expected + 3) & !3;
+        if entry.original_value != expected
+            && !((entry.original_value == aligned || entry.original_value == padded)
+                && is_padding(expected, entry.original_value))
+        {
             eprintln!(
-                "split: gap in {} at 0x{:x} (expected 0x{:x} or 0x{:x}, symbol {})",
-                section_name, entry.original_value, expected, aligned, entry.name
+                "split: gap in {} from 0x{:x} to 0x{:x} is not padding (symbol {})",
+                section_name, expected, entry.original_value, entry.name
             );
             return None;
         }
@@ -86,21 +131,24 @@ fn collect_split_info(elf: &Elf, section_name: &str) -> Option<SectionSplit> {
         section.sh_size
     };
 
-    if expected != actual_size {
-        eprintln!(
-            "split: {} symbol coverage 0x{:x} != section size 0x{:x}",
-            section_name, expected, actual_size
-        );
+    // Allow mwcc padding after the last symbol
+    let padded = (expected + 3) & !3;
+    if expected != actual_size && !(actual_size == padded && is_padding(expected, padded)) {
+        if expected < actual_size {
+            eprintln!(
+                "split: gap in {} from 0x{:x} to 0x{:x} is not padding (section end)",
+                section_name, expected, actual_size
+            );
+        } else {
+            eprintln!(
+                "split: {} symbol coverage 0x{:x} != section size 0x{:x}",
+                section_name, expected, actual_size
+            );
+        }
         return None;
     }
     
     entries.sort_by_key(|e| e.sym_idx);
-
-    let rel_name = format!(".rel{}", section_name);
-    let rel_section_idx = elf
-        .sections
-        .iter()
-        .position(|s| s.name == rel_name && s.sh_type == SHT_REL);
 
     Some(SectionSplit {
         section_idx,
